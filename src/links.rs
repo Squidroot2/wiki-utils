@@ -63,9 +63,10 @@ impl LinkCalculator {
         drop(guard);
         let layer_one = Arc::new(layer_one);
 
-        let mut layers: Vec<LayerRef> = Vec::new();
-        layers.push(layer_zero);
-        layers.push(layer_one);
+        let layers: Vec<LayerRef> = vec![
+            layer_zero, layer_one
+        ];
+
         let layers = Arc::new(RwLock::new(layers));
 
         Ok(LinkCalculator {
@@ -94,8 +95,7 @@ impl LinkCalculator {
             let previous_layers_clone = self.layers.clone();
 
             let handle = tokio::spawn(async move  {
-                let result = Self::store_article_links(link, this_layer_clone, known_redirects_clone, previous_layers_clone).await;
-                result
+                Self::store_article_links(link, this_layer_clone, known_redirects_clone, previous_layers_clone).await
             });
             handles_all.get_mut(index / CLIENT_LIMIT).ok_or(LinkCalcError::HandleBoundsError)?.push(handle);
         }
@@ -185,16 +185,16 @@ impl fmt::Display for LinkCalculator {
             for endpoint in layer.iter(&guard) {
                 match decode_url_str(endpoint) {
                     Ok(decoded) => {
-                        write!(f, "{}\n", decoded)?;
+                        writeln!(f, "{}", decoded)?;
                     },
                     Err(e) => {
                         error!("Failed to parse '{}'; Reason: {}", endpoint, e);
-                        write!(f, "{}\n", endpoint)?;
+                        writeln!(f, "{}", endpoint)?;
                     }
                 };
 
             }
-            write!(f, "------------------\n")?;
+            writeln!(f, "------------------")?;
         }
         Ok(())
     }

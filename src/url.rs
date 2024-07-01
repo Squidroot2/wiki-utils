@@ -105,10 +105,10 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
-            Self::OddLengthHexString => format!("Hex String has odd number of characters"),
-            Self::HexNotValidByte => format!("Failed to convert hex code to u8 value"),
-            Self::ByteVecNotUtf8 => format!("Bytes from hex string is not valid utf8"),
-            Self::IncompleteParse => format!("String ended on incomplete hex code"),
+            Self::OddLengthHexString => "Hex String has odd number of characters",
+            Self::HexNotValidByte => "Failed to convert hex code to u8 value",
+            Self::ByteVecNotUtf8 => "Bytes from hex string is not valid utf8",
+            Self::IncompleteParse => "String ended on incomplete hex code",
         };
         write!(f, "{}", msg)
     }

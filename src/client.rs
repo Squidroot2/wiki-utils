@@ -11,15 +11,14 @@ use crate::article::Article;
 const BASE_URL: &str = "https://en.wikipedia.org/wiki/";
 const RANDOM_ARTICLE_ENDPOINT: &str = "Special:Random";
 
+#[derive(Default)]
 pub struct AsyncClient {
     client: Client,
 }
 
 impl AsyncClient {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        Self::default()
     }
 
     pub async fn get_article(&self, article_name: &str) -> Result<Article, ClientError> {
