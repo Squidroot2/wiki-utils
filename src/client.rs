@@ -29,7 +29,10 @@ impl AsyncClient {
         let response = self.client.get(&url).send().await?;
 
         let final_url = response.url().as_str();
-        let final_endpoint = final_url.strip_prefix(BASE_URL).ok_or_else(|| ClientError::redirect(final_url.to_string()))?.to_owned();
+        let final_endpoint = final_url
+            .strip_prefix(BASE_URL)
+            .ok_or_else(|| ClientError::redirect(final_url.to_string()))?
+            .to_owned();
 
         let response_text = response.text().await?;
         let html = Html::parse_document(&response_text);
@@ -68,7 +71,4 @@ impl From<reqwest::Error> for ClientError {
     }
 }
 
-impl Error for ClientError {
-
-}
-
+impl Error for ClientError {}

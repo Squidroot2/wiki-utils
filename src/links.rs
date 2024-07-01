@@ -1,13 +1,14 @@
 use std::error::Error;
-use std::sync::{Arc, RwLock, PoisonError};
 use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock};
 
-use futures::future::join_all;
-use flurry::HashSet;
 use flurry::HashMap;
+use flurry::HashSet;
+use futures::future::join_all;
+use log::{debug, error, info};
+use tokio::sync::AcquireError;
+use tokio::sync::Semaphore;
 use tokio::task::JoinError;
-use log::error;
-
 
 use crate::article::{Article, ArticleError};
 use crate::client::AsyncClient;
@@ -18,7 +19,7 @@ type LayerRef = Arc<HashSet<String>>;
 type LayerGroupRef = Arc<RwLock<Vec<LayerRef>>>;
 type RedirectMapRef = Arc<HashMap<String, String>>;
 
-const CLIENT_LIMIT: usize = 32;
+const CONNECTION_LIMIT: usize = 32;
 
 #[derive(Debug)]
 pub struct LinkCalculator {
@@ -63,11 +64,7 @@ impl LinkCalculator {
         drop(guard);
         let layer_one = Arc::new(layer_one);
 
-        let layers: Vec<LayerRef> = vec![
-            layer_zero, layer_one
-        ];
-
-        let layers = Arc::new(RwLock::new(layers));
+        let layers = Arc::new(RwLock::new(vec![layer_zero, layer_one]));
 
         Ok(LinkCalculator {
             layers,
@@ -76,41 +73,50 @@ impl LinkCalculator {
     }
 
     pub async fn compute_next_async(&mut self) -> Result<(), LinkCalcError> {
+        let client = Arc::new(AsyncClient::new());
+
         let last_layer = self.get_last_layer()?;
         let this_layer = LayerRef::new(HashSet::new());
 
-        let rounds = last_layer.len() / CLIENT_LIMIT + 1;
-        let mut handles_all = Vec::with_capacity(rounds);
-        for _ in 0..rounds {
-            handles_all.push(Vec::with_capacity(CLIENT_LIMIT))
-        }
+        let mut handles = Vec::with_capacity(last_layer.len());
         let guard = last_layer.guard();
 
         let link_iter = last_layer.iter(&guard);
 
-        for (index, link_ref) in link_iter.enumerate() {
+        let semaphore = Arc::new(Semaphore::new(CONNECTION_LIMIT));
+
+        for link_ref in link_iter {
             let link = link_ref.clone();
             let this_layer_clone = this_layer.clone();
             let known_redirects_clone = self.known_redirects.clone();
             let previous_layers_clone = self.layers.clone();
+            let client_clone = client.clone();
+            let semaphore_clone = semaphore.clone();
 
-            let handle = tokio::spawn(async move  {
-                Self::store_article_links(link, this_layer_clone, known_redirects_clone, previous_layers_clone).await
+            let handle = tokio::spawn(async move {
+                let permit = semaphore_clone.acquire().await?;
+                let result = Self::store_article_links(
+                    &client_clone,
+                    link,
+                    this_layer_clone,
+                    known_redirects_clone,
+                    previous_layers_clone,
+                )
+                .await;
+                drop(permit);
+                result
             });
-            handles_all.get_mut(index / CLIENT_LIMIT).ok_or(LinkCalcError::HandleBoundsError)?.push(handle);
+
+            handles.push(handle);
         }
-        let mut results = Vec::with_capacity(last_layer.len());
-        for handle_round in handles_all {
-            let round_results = join_all(handle_round).await;
-            results.extend(round_results);
-        }
+        let results = join_all(handles).await;
 
         let mut new_redirects = Vec::new();
         for result in results {
             match result {
                 Ok(Ok(thread_new_redirects)) => {
                     new_redirects.extend(thread_new_redirects);
-                },
+                }
                 Ok(Err(e)) => return Err(e),
                 Err(e) => return Err(e.into()),
             };
@@ -131,27 +137,52 @@ impl LinkCalculator {
     }
 
     fn get_last_layer(&self) -> Result<LayerRef, LinkCalcError> {
-        Ok(self.layers.read()?.last().ok_or(LinkCalcError::NotInitializedError)?.clone())
+        Ok(self
+            .layers
+            .read()?
+            .last()
+            .ok_or(LinkCalcError::NotInitializedError)?
+            .clone())
     }
 
     // Returns new article redirects
-    async fn store_article_links(link: String, this_layer: LayerRef, known_redirects: RedirectMapRef, previous_layers: LayerGroupRef) -> Result<Vec<(String, String)>, LinkCalcError> {
-        let client = AsyncClient::new();
-        let mut new_redirects = Vec::new();
+    async fn store_article_links(
+        client: &AsyncClient,
+        link: String,
+        this_layer: LayerRef,
+        known_redirects: RedirectMapRef,
+        previous_layers: LayerGroupRef,
+    ) -> Result<Vec<(String, String)>, LinkCalcError> {
         let neighbor_article = client.get_article(&link).await?;
+
+        let mut new_redirects = Vec::new();
         if link.ne(neighbor_article.get_endpoint()) {
             // We were redericted. Stores this
-            new_redirects.push((link.to_string(), neighbor_article.get_endpoint().to_string()));
+            new_redirects.push((
+                link.to_string(),
+                neighbor_article.get_endpoint().to_string(),
+            ));
             let guard = known_redirects.guard();
-            known_redirects.insert(link.to_string(), neighbor_article.get_endpoint().to_string(), &guard);
+            known_redirects.insert(
+                link.to_string(),
+                neighbor_article.get_endpoint().to_string(),
+                &guard,
+            );
         }
 
         for neighbor_link in neighbor_article.get_article_links()? {
-                if Self::find_in_previous_layer(previous_layers.clone(), known_redirects.clone(), &neighbor_link)?.is_none() {
-                    let guard = this_layer.guard();
-                    this_layer.insert(neighbor_link, &guard);
-                }
+            if Self::find_in_previous_layer(
+                previous_layers.clone(),
+                known_redirects.clone(),
+                &neighbor_link,
+            )?
+            .is_none()
+            {
+                let guard = this_layer.guard();
+                this_layer.insert(neighbor_link, &guard);
             }
+        }
+        debug!("Finished storing links for endpoint {}", link);
         Ok(new_redirects)
     }
 
@@ -164,9 +195,15 @@ impl LinkCalculator {
         }
     }
 
-    fn find_in_previous_layer(previous_layers: LayerGroupRef, known_redirects: RedirectMapRef, endpoint: &str) -> Result<Option<usize>, LinkCalcError> {
+    fn find_in_previous_layer(
+        previous_layers: LayerGroupRef,
+        known_redirects: RedirectMapRef,
+        endpoint: &str,
+    ) -> Result<Option<usize>, LinkCalcError> {
         let guard = known_redirects.guard();
-        let real_endpoint = known_redirects.get(endpoint, &guard).map_or(endpoint, |s| s.as_str());
+        let real_endpoint = known_redirects
+            .get(endpoint, &guard)
+            .map_or(endpoint, |s| s.as_str());
         for (layer_num, layer) in previous_layers.read()?.iter().enumerate() {
             let guard = layer.guard();
             if layer.contains(real_endpoint, &guard) {
@@ -177,7 +214,6 @@ impl LinkCalculator {
     }
 }
 
-
 impl fmt::Display for LinkCalculator {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for layer in self.layers.read().unwrap().iter() {
@@ -186,13 +222,12 @@ impl fmt::Display for LinkCalculator {
                 match decode_url_str(endpoint) {
                     Ok(decoded) => {
                         writeln!(f, "{}", decoded)?;
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to parse '{}'; Reason: {}", endpoint, e);
                         writeln!(f, "{}", endpoint)?;
                     }
                 };
-
             }
             writeln!(f, "------------------")?;
         }
@@ -207,7 +242,7 @@ pub enum LinkCalcError {
     LockError,
     NotInitializedError,
     JoinError(JoinError),
-    HandleBoundsError
+    SemaphoreAcquireError(AcquireError),
 }
 
 impl fmt::Display for LinkCalcError {
@@ -230,7 +265,7 @@ impl From<ClientError> for LinkCalcError {
 }
 
 impl From<JoinError> for LinkCalcError {
-    fn from(e: JoinError) ->LinkCalcError {
+    fn from(e: JoinError) -> LinkCalcError {
         LinkCalcError::JoinError(e)
     }
 }
@@ -241,7 +276,10 @@ impl<T> From<PoisonError<T>> for LinkCalcError {
     }
 }
 
-
-impl Error for LinkCalcError {
-
+impl From<AcquireError> for LinkCalcError {
+    fn from(e: AcquireError) -> LinkCalcError {
+        Self::SemaphoreAcquireError(e)
+    }
 }
+
+impl Error for LinkCalcError {}
