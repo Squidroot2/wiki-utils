@@ -1,19 +1,17 @@
-use std::error::Error;
 use std::collections::HashSet;
+use std::error::Error;
 use std::fmt;
 
+use log::{error, warn};
 use once_cell::sync::Lazy;
-use scraper::{ selectable::Selectable, ElementRef, Html, Selector};
+use scraper::{selectable::Selectable, ElementRef, Html, Selector};
 
-static ARTICLE_BODY_SELECTOR: Lazy<Selector> = Lazy::new(|| {
-    Selector::parse("#mw-content-text").unwrap()
-});
-static LINK_SELECTOR: Lazy<Selector> = Lazy::new(|| {
-    Selector::parse("a").unwrap()
-});
-static HEADING_SELECTOR: Lazy<Selector> = Lazy::new(|| {
-    Selector::parse("#firstHeading span").unwrap()
-});
+const ARTICLE_BODY_CSS: &str = "#mw-content-text";
+const HEADING_CSS: &str = "#firstHeading span";
+
+static ARTICLE_BODY_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse(ARTICLE_BODY_CSS).unwrap());
+static HEADING_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse(HEADING_CSS).unwrap());
+static LINK_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("a[href^='/wiki/'").unwrap());
 
 pub struct Article {
     endpoint: String,
@@ -22,10 +20,11 @@ pub struct Article {
 
 impl Article {
     pub fn new(endpoint: String, html: Html) -> Self {
-        Article {
-            endpoint,
-            html,
+        let errors = html.errors.join(";");
+        if !errors.is_empty() {
+            warn!("Instantiating Article '{}' with errors: {}", endpoint, errors);
         }
+        Article { endpoint, html }
     }
 
     pub fn get_endpoint(&self) -> &str {
@@ -36,11 +35,11 @@ impl Article {
         let inner_nodes = self.get_article_body()?.children();
         let mut lead_paragraphs = Vec::new();
         for node in inner_nodes {
-           if let Some(element) = node.value().as_element() {
-               match element.name() {
+            if let Some(element) = node.value().as_element() {
+                match element.name() {
                     "p" => lead_paragraphs.push(ElementRef::wrap(node).ok_or(ArticleError::ElementError)?),
                     "h2" => break,
-                    _ => continue
+                    _ => continue,
                 }
             }
         }
@@ -48,17 +47,23 @@ impl Article {
         for paragraph in lead_paragraphs {
             lead_string.push_str(&paragraph.html());
         }
-         Ok(lead_string)
+        Ok(lead_string)
     }
 
     pub fn get_article_body(&self) -> Result<ElementRef<'_>, ArticleError> {
-        let body_parent = self.html.select(&ARTICLE_BODY_SELECTOR).next().ok_or(ArticleError::MissingBodyParent)?;
+        let body_parent = self
+            .html
+            .select(&ARTICLE_BODY_SELECTOR)
+            .next()
+            .ok_or(ArticleError::MissingBodyParent)?;
         let body = body_parent.first_child().ok_or(ArticleError::MissingBody)?;
-        ElementRef::wrap(body).ok_or(ArticleError::ElementError)
-
+        ElementRef::wrap(body).ok_or_else(|| {
+            error!("Failed to wrap node '{:?}' as element", body);
+            ArticleError::ElementError
+        })
     }
 
-    pub fn get_article_links(&self) -> Result<HashSet<String>, ArticleError> {
+    pub fn create_article_link_set(&self) -> Result<HashSet<String>, ArticleError> {
         let article_body = self.get_article_body()?;
         let links = article_body.select(&LINK_SELECTOR);
         let mut endpoints = HashSet::new();
@@ -82,6 +87,26 @@ impl Article {
     }
 }
 
+impl<'this> Article {
+    pub fn get_article_link_refs(&'this self) -> Result<HashSet<&'this str>, ArticleError> {
+        let article_body = self.get_article_body()?;
+        let links = article_body.select(&LINK_SELECTOR);
+        let mut endpoints = HashSet::new();
+        for link in links {
+            if let Some(href) = link.value().attr("href") {
+                if let Some(wiki_link) = href.strip_prefix("/wiki/") {
+                    if !wiki_link.contains(':') {
+                        let page_wiki_link = wiki_link.split('#').next().expect("Will always have one element in split");
+                        endpoints.insert(page_wiki_link);
+                    }
+                }
+            }
+        }
+
+        Ok(endpoints)
+    }
+}
+
 #[derive(Debug)]
 pub enum ArticleError {
     MissingBodyParent,
@@ -92,11 +117,13 @@ pub enum ArticleError {
 
 impl fmt::Display for ArticleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        //TODO
-        write!(f, "ArticleError")
+        match self {
+            Self::MissingBodyParent => write!(f, "Cannot find element with css '{}'", ARTICLE_BODY_CSS),
+            Self::MissingBody => write!(f, "Cannot find child of element with css '{}'", ARTICLE_BODY_CSS),
+            Self::MissingHeading => write!(f, "Cannot find element with css '{}'", HEADING_CSS),
+            Self::ElementError => write!(f, "Failed to convert node to element"),
+        }
     }
 }
 
-impl Error for ArticleError {
-
-}
+impl Error for ArticleError {}

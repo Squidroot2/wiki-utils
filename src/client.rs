@@ -3,6 +3,8 @@ use std::fmt;
 
 use reqwest::Client;
 use scraper::Html;
+use tokio::sync::AcquireError;
+use tokio::sync::Semaphore;
 
 use log::debug;
 
@@ -10,6 +12,8 @@ use crate::article::Article;
 
 const BASE_URL: &str = "https://en.wikipedia.org/wiki/";
 const RANDOM_ARTICLE_ENDPOINT: &str = "Special:Random";
+
+static CONNECTION_PERMITS: Semaphore = Semaphore::const_new(100);
 
 #[derive(Default)]
 pub struct AsyncClient {
@@ -26,7 +30,9 @@ impl AsyncClient {
         url.push_str(article_name);
         debug!("Sending request to {}", url);
 
+        let permit = CONNECTION_PERMITS.acquire().await?;
         let response = self.client.get(&url).send().await?;
+        drop(permit);
 
         let final_url = response.url().as_str();
         let final_endpoint = final_url
@@ -50,6 +56,7 @@ impl AsyncClient {
 pub enum ClientError {
     RequestError(reqwest::Error),
     RedirectError(String),
+    SemaphoreAcquireError(AcquireError),
 }
 
 impl ClientError {
@@ -68,6 +75,12 @@ impl fmt::Display for ClientError {
 impl From<reqwest::Error> for ClientError {
     fn from(e: reqwest::Error) -> ClientError {
         ClientError::RequestError(e)
+    }
+}
+
+impl From<AcquireError> for ClientError {
+    fn from(e: AcquireError) -> Self {
+        Self::SemaphoreAcquireError(e)
     }
 }
 

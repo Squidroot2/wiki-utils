@@ -5,9 +5,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use flurry::HashMap;
 use flurry::HashSet;
 use futures::future::join_all;
-use log::{debug, error, info};
-use tokio::sync::AcquireError;
-use tokio::sync::Semaphore;
+use log::{debug, error};
 use tokio::task::JoinError;
 
 use crate::article::{Article, ArticleError};
@@ -18,8 +16,6 @@ use crate::url::decode_url_str;
 type LayerRef = Arc<HashSet<String>>;
 type LayerGroupRef = Arc<RwLock<Vec<LayerRef>>>;
 type RedirectMapRef = Arc<HashMap<String, String>>;
-
-const CONNECTION_LIMIT: usize = 32;
 
 #[derive(Debug)]
 pub struct LinkCalculator {
@@ -54,12 +50,13 @@ impl LinkCalculator {
     pub fn from_article(first_article: &Article) -> Result<Self, ArticleError> {
         let layer_zero: LayerRef = Self::layer_zero(first_article.get_endpoint().to_string());
 
-        let mut links = first_article.get_article_links()?;
+        //let mut links = first_article.create_article_link_set()?;
+        let links = first_article.get_article_link_refs()?;
 
         let layer_one = HashSet::with_capacity(links.len());
         let guard = layer_one.guard();
-        for link in links.drain() {
-            layer_one.insert(link, &guard);
+        for link in links {
+            layer_one.insert(link.to_owned(), &guard);
         }
         drop(guard);
         let layer_one = Arc::new(layer_one);
@@ -83,28 +80,15 @@ impl LinkCalculator {
 
         let link_iter = last_layer.iter(&guard);
 
-        let semaphore = Arc::new(Semaphore::new(CONNECTION_LIMIT));
-
         for link_ref in link_iter {
             let link = link_ref.clone();
             let this_layer_clone = this_layer.clone();
             let known_redirects_clone = self.known_redirects.clone();
             let previous_layers_clone = self.layers.clone();
             let client_clone = client.clone();
-            let semaphore_clone = semaphore.clone();
 
             let handle = tokio::spawn(async move {
-                let permit = semaphore_clone.acquire().await?;
-                let result = Self::store_article_links(
-                    &client_clone,
-                    link,
-                    this_layer_clone,
-                    known_redirects_clone,
-                    previous_layers_clone,
-                )
-                .await;
-                drop(permit);
-                result
+                Self::store_article_links(&client_clone, link, this_layer_clone, known_redirects_clone, previous_layers_clone).await
             });
 
             handles.push(handle);
@@ -137,12 +121,7 @@ impl LinkCalculator {
     }
 
     fn get_last_layer(&self) -> Result<LayerRef, LinkCalcError> {
-        Ok(self
-            .layers
-            .read()?
-            .last()
-            .ok_or(LinkCalcError::NotInitializedError)?
-            .clone())
+        Ok(self.layers.read()?.last().ok_or(LinkCalcError::NotInitializedError)?.clone())
     }
 
     // Returns new article redirects
@@ -158,26 +137,21 @@ impl LinkCalculator {
         let mut new_redirects = Vec::new();
         if link.ne(neighbor_article.get_endpoint()) {
             // We were redericted. Stores this
-            new_redirects.push((
-                link.to_string(),
-                neighbor_article.get_endpoint().to_string(),
-            ));
+            new_redirects.push((link.to_string(), neighbor_article.get_endpoint().to_string()));
             let guard = known_redirects.guard();
-            known_redirects.insert(
-                link.to_string(),
-                neighbor_article.get_endpoint().to_string(),
-                &guard,
-            );
+            known_redirects.insert(link.to_string(), neighbor_article.get_endpoint().to_string(), &guard);
         }
 
-        for neighbor_link in neighbor_article.get_article_links()? {
-            if Self::find_in_previous_layer(
-                previous_layers.clone(),
-                known_redirects.clone(),
-                &neighbor_link,
-            )?
-            .is_none()
-            {
+        let neighbor_links = match neighbor_article.create_article_link_set() {
+            Ok(links) => links,
+            Err(e) => {
+                error!("Failed to identify links for article '{}'; Reason: '{}'", link, e);
+                return Err(LinkCalcError::from(e));
+            }
+        };
+
+        for neighbor_link in neighbor_links {
+            if Self::find_in_previous_layer(previous_layers.clone(), known_redirects.clone(), &neighbor_link)?.is_none() {
                 let guard = this_layer.guard();
                 this_layer.insert(neighbor_link, &guard);
             }
@@ -201,9 +175,7 @@ impl LinkCalculator {
         endpoint: &str,
     ) -> Result<Option<usize>, LinkCalcError> {
         let guard = known_redirects.guard();
-        let real_endpoint = known_redirects
-            .get(endpoint, &guard)
-            .map_or(endpoint, |s| s.as_str());
+        let real_endpoint = known_redirects.get(endpoint, &guard).map_or(endpoint, |s| s.as_str());
         for (layer_num, layer) in previous_layers.read()?.iter().enumerate() {
             let guard = layer.guard();
             if layer.contains(real_endpoint, &guard) {
@@ -216,21 +188,47 @@ impl LinkCalculator {
 
 impl fmt::Display for LinkCalculator {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for layer in self.layers.read().unwrap().iter() {
+        let unlocked_layers = self.layers.read().map_err(|_| fmt::Error)?;
+
+        let mut layer_iter = unlocked_layers.iter().enumerate();
+
+        // First, Write the article name
+        let (_0, layer_zero) = layer_iter.next().ok_or(fmt::Error)?;
+        let guard = layer_zero.guard();
+        let article_name = layer_zero.iter(&guard).next().map(|a| a.as_str()).unwrap_or("");
+        match decode_url_str(article_name) {
+            Ok(decoded) => {
+                writeln!(f, "Article Name: {}", decoded)?;
+            }
+            Err(e) => {
+                error!("Failed to parse '{}'; Reason: {}", article_name, e);
+                writeln!(f, "Endpoint Name (unparseable): {}", article_name)?;
+            }
+        }
+
+        while let Some((i, layer)) = layer_iter.next() {
             let guard = layer.guard();
+            writeln!(f, "{}-Hop Neighbors ({}):", i, layer.len())?;
             for endpoint in layer.iter(&guard) {
                 match decode_url_str(endpoint) {
                     Ok(decoded) => {
-                        writeln!(f, "{}", decoded)?;
+                        writeln!(f, "\t{}", decoded)?;
                     }
                     Err(e) => {
                         error!("Failed to parse '{}'; Reason: {}", endpoint, e);
-                        writeln!(f, "{}", endpoint)?;
+                        writeln!(f, "\t{}", endpoint)?;
                     }
                 };
             }
-            writeln!(f, "------------------")?;
         }
+
+        writeln!(f, "Known Redirects ({}):", self.known_redirects.len())?;
+
+        let guard = self.known_redirects.guard();
+        for (link, target) in self.known_redirects.iter(&guard) {
+            writeln!(f, "\t{} -> {}", link, target)?;
+        }
+
         Ok(())
     }
 }
@@ -242,7 +240,6 @@ pub enum LinkCalcError {
     LockError,
     NotInitializedError,
     JoinError(JoinError),
-    SemaphoreAcquireError(AcquireError),
 }
 
 impl fmt::Display for LinkCalcError {
@@ -273,12 +270,6 @@ impl From<JoinError> for LinkCalcError {
 impl<T> From<PoisonError<T>> for LinkCalcError {
     fn from(_: PoisonError<T>) -> LinkCalcError {
         LinkCalcError::LockError
-    }
-}
-
-impl From<AcquireError> for LinkCalcError {
-    fn from(e: AcquireError) -> LinkCalcError {
-        Self::SemaphoreAcquireError(e)
     }
 }
 
