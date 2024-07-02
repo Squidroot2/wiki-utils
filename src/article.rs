@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
-use log::{error, warn};
+use log::{debug, error, warn};
 use once_cell::sync::Lazy;
 use scraper::{selectable::Selectable, ElementRef, Html, Selector};
 
@@ -20,10 +20,6 @@ pub struct Article {
 
 impl Article {
     pub fn new(endpoint: String, html: Html) -> Self {
-        let errors = html.errors.join(";");
-        if !errors.is_empty() {
-            warn!("Instantiating Article '{}' with errors: {}", endpoint, errors);
-        }
         Article { endpoint, html }
     }
 
@@ -51,11 +47,13 @@ impl Article {
     }
 
     pub fn get_article_body(&self) -> Result<ElementRef<'_>, ArticleError> {
-        let body_parent = self
-            .html
-            .select(&ARTICLE_BODY_SELECTOR)
-            .next()
-            .ok_or(ArticleError::MissingBodyParent)?;
+        let body_parent = match self.html.select(&ARTICLE_BODY_SELECTOR).next() {
+            Some(element) => element,
+            None => {
+                debug!("No '{}' found in {}", ARTICLE_BODY_CSS, self.html.html());
+                return Err(ArticleError::MissingBodyParent);
+            }
+        };
         let body = body_parent.first_child().ok_or(ArticleError::MissingBody)?;
         ElementRef::wrap(body).ok_or_else(|| {
             error!("Failed to wrap node '{:?}' as element", body);
@@ -88,16 +86,17 @@ impl Article {
 }
 
 impl<'this> Article {
-    pub fn get_article_link_refs(&'this self) -> Result<HashSet<&'this str>, ArticleError> {
+    // This seems to be slightly faster than creating a new set
+    pub fn get_article_link_refs(&'this self) -> Result<Vec<&'this str>, ArticleError> {
         let article_body = self.get_article_body()?;
         let links = article_body.select(&LINK_SELECTOR);
-        let mut endpoints = HashSet::new();
+        let mut endpoints = Vec::new();
         for link in links {
             if let Some(href) = link.value().attr("href") {
                 if let Some(wiki_link) = href.strip_prefix("/wiki/") {
                     if !wiki_link.contains(':') {
                         let page_wiki_link = wiki_link.split('#').next().expect("Will always have one element in split");
-                        endpoints.insert(page_wiki_link);
+                        endpoints.push(page_wiki_link);
                     }
                 }
             }

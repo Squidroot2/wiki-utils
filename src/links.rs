@@ -5,7 +5,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use flurry::HashMap;
 use flurry::HashSet;
 use futures::future::join_all;
-use log::{debug, error};
+use log::{debug, error, info};
 use tokio::task::JoinError;
 
 use crate::article::{Article, ArticleError};
@@ -47,6 +47,10 @@ impl LinkCalculator {
         }
     }
 
+    pub fn get_layer_count(&self) -> Result<usize, LinkCalcError> {
+        Ok(self.layers.read()?.len())
+    }
+
     pub fn from_article(first_article: &Article) -> Result<Self, ArticleError> {
         let layer_zero: LayerRef = Self::layer_zero(first_article.get_endpoint().to_string());
 
@@ -70,6 +74,7 @@ impl LinkCalculator {
     }
 
     pub async fn compute_next_async(&mut self) -> Result<(), LinkCalcError> {
+        info!("Calculating layer {}", self.get_layer_count()?);
         let client = Arc::new(AsyncClient::new());
 
         let last_layer = self.get_last_layer()?;
@@ -131,16 +136,18 @@ impl LinkCalculator {
         this_layer: LayerRef,
         known_redirects: RedirectMapRef,
         previous_layers: LayerGroupRef,
-    ) -> Result<Vec<(String, String)>, LinkCalcError> {
+    ) -> Result<Option<(String, String)>, LinkCalcError> {
         let neighbor_article = client.get_article(&link).await?;
 
-        let mut new_redirects = Vec::new();
-        if link.ne(neighbor_article.get_endpoint()) {
-            // We were redericted. Stores this
-            new_redirects.push((link.to_string(), neighbor_article.get_endpoint().to_string()));
-            let guard = known_redirects.guard();
-            known_redirects.insert(link.to_string(), neighbor_article.get_endpoint().to_string(), &guard);
-        }
+        let new_redirect = match link.eq(neighbor_article.get_endpoint()) {
+            true => None,
+            false => {
+                info!("Found redirect: {} -> {}", link, neighbor_article.get_endpoint());
+                let guard = known_redirects.guard();
+                known_redirects.insert(link.to_string(), neighbor_article.get_endpoint().to_string(), &guard);
+                Some((link.to_string(), neighbor_article.get_endpoint().to_string()))
+            }
+        };
 
         let neighbor_links = match neighbor_article.create_article_link_set() {
             Ok(links) => links,
@@ -157,7 +164,7 @@ impl LinkCalculator {
             }
         }
         debug!("Finished storing links for endpoint {}", link);
-        Ok(new_redirects)
+        Ok(new_redirect)
     }
 
     // Replace redirects
