@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
-use log::{debug, error, warn};
+use log::{debug, error};
 use once_cell::sync::Lazy;
 use scraper::{selectable::Selectable, ElementRef, Html, Selector};
 
