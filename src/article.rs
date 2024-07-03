@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
@@ -61,33 +60,12 @@ impl Article {
         })
     }
 
-    pub fn create_article_link_set(&self) -> Result<HashSet<String>, ArticleError> {
-        let article_body = self.get_article_body()?;
-        let links = article_body.select(&LINK_SELECTOR);
-        let mut endpoints = HashSet::new();
-        for link in links {
-            if let Some(href) = link.value().attr("href") {
-                if let Some(wiki_link) = href.strip_prefix("/wiki/") {
-                    if !wiki_link.contains(':') {
-                        let page_wiki_link = wiki_link.split('#').next().expect("Will always have one element in split");
-                        endpoints.insert(page_wiki_link.to_owned());
-                    }
-                }
-            }
-        }
-
-        Ok(endpoints)
-    }
-
     pub fn get_article_title(&self) -> Result<String, ArticleError> {
         let heading_span = self.html.select(&HEADING_SELECTOR).next().ok_or(ArticleError::MissingHeading)?;
         Ok(heading_span.inner_html())
     }
-}
 
-impl<'this> Article {
-    // This seems to be slightly faster than creating a new set
-    pub fn get_article_link_refs(&'this self) -> Result<Vec<&'this str>, ArticleError> {
+    pub fn get_article_link_refs(&self) -> Result<Vec<&'_ str>, ArticleError> {
         let article_body = self.get_article_body()?;
         let links = article_body.select(&LINK_SELECTOR);
         let mut endpoints = Vec::new();

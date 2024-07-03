@@ -24,15 +24,6 @@ pub struct LinkCalculator {
 }
 
 impl LinkCalculator {
-    // Create First Layer containing start point
-    fn layer_zero(start_point: String) -> LayerRef {
-        let start: LayerRef = Arc::new(HashSet::with_capacity(1));
-        let guard = start.guard();
-        start.insert(start_point, &guard);
-        drop(guard);
-        start
-    }
-
     pub fn new(start_point: String) -> Self {
         let mut layers: Vec<LayerRef> = Vec::new();
 
@@ -47,14 +38,10 @@ impl LinkCalculator {
         }
     }
 
-    pub fn get_layer_count(&self) -> Result<usize, LinkCalcError> {
-        Ok(self.layers.read()?.len())
-    }
-
     pub fn from_article(first_article: &Article) -> Result<Self, ArticleError> {
         let layer_zero: LayerRef = Self::layer_zero(first_article.get_endpoint().to_string());
 
-        //let mut links = first_article.create_article_link_set()?;
+        info!("Creating layer 1 from links of given article");
         let links = first_article.get_article_link_refs()?;
 
         let layer_one = HashSet::with_capacity(links.len());
@@ -73,6 +60,10 @@ impl LinkCalculator {
         })
     }
 
+    pub fn get_layer_count(&self) -> Result<usize, LinkCalcError> {
+        Ok(self.layers.read()?.len())
+    }
+
     pub async fn compute_next_async(&mut self) -> Result<(), LinkCalcError> {
         info!("Calculating layer {}", self.get_layer_count()?);
         let client = Arc::new(AsyncClient::new());
@@ -86,7 +77,7 @@ impl LinkCalculator {
         let link_iter = last_layer.iter(&guard);
 
         for link_ref in link_iter {
-            let link = link_ref.clone();
+            let link = link_ref.to_owned();
             let this_layer_clone = this_layer.clone();
             let known_redirects_clone = self.known_redirects.clone();
             let previous_layers_clone = self.layers.clone();
@@ -137,7 +128,13 @@ impl LinkCalculator {
         known_redirects: RedirectMapRef,
         previous_layers: LayerGroupRef,
     ) -> Result<Option<(String, String)>, LinkCalcError> {
-        let neighbor_article = client.get_article(&link).await?;
+        let neighbor_article = match client.get_article(&link).await {
+            Ok(article) => article,
+            Err(e) => {
+                error!("Failed to retrieve article '{}'; Reason {}", link, e);
+                return Ok(None);
+            }
+        };
 
         let new_redirect = match link.eq(neighbor_article.get_endpoint()) {
             true => None,
@@ -149,21 +146,21 @@ impl LinkCalculator {
             }
         };
 
-        let neighbor_links = match neighbor_article.create_article_link_set() {
+        let neighbor_links = match neighbor_article.get_article_link_refs() {
             Ok(links) => links,
             Err(e) => {
-                error!("Failed to identify links for article '{}'; Reason: '{}'", link, e);
-                return Err(LinkCalcError::from(e));
+                error!("Failed to identify links for article '{}'; Reason: {}", link, e);
+                Vec::new()
             }
         };
 
         for neighbor_link in neighbor_links {
-            if Self::find_in_previous_layer(previous_layers.clone(), known_redirects.clone(), &neighbor_link)?.is_none() {
+            if Self::find_in_previous_layer(previous_layers.clone(), known_redirects.clone(), neighbor_link)?.is_none() {
                 let guard = this_layer.guard();
-                this_layer.insert(neighbor_link, &guard);
+                this_layer.insert(neighbor_link.to_string(), &guard);
             }
         }
-        debug!("Finished storing links for endpoint {}", link);
+        debug!("Finished storing links for endpoint: {}", link);
         Ok(new_redirect)
     }
 
@@ -190,6 +187,15 @@ impl LinkCalculator {
             }
         }
         Ok(None)
+    }
+
+    // Create First Layer containing start point
+    fn layer_zero(start_point: String) -> LayerRef {
+        let start: LayerRef = Arc::new(HashSet::with_capacity(1));
+        let guard = start.guard();
+        start.insert(start_point, &guard);
+        drop(guard);
+        start
     }
 }
 
